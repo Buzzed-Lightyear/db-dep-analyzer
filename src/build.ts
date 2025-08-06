@@ -1,3 +1,20 @@
+// ---------------------------------------------------------------------------
+// build.ts
+// ---------------------------------------------------------------------------
+//
+// Responsible for transforming a set of CSV exports from an Oracle database
+// into a graph representation of dependencies.  The process can be broken down
+// into three high‑level phases:
+//
+//   1. Load raw tabular data from CSV files
+//   2. Combine that data into an in‑memory graph of `DbObject` instances
+//   3. Serialize the graph to various output formats (JSON for the visualizer
+//      and a CSV summary for ad‑hoc querying)
+//
+// The graph is ultimately stored in `data/nodes.json` where each node
+// corresponds to a single database object and contains its transitive
+// dependencies.
+// ---------------------------------------------------------------------------
 import {
   DbObject,
   findUsage,
@@ -9,19 +26,25 @@ import { createWriteStream, writeFileSync } from "fs";
 import { join } from "path";
 import { gzipSync } from "zlib";
 
+// Interfaces describing the structure of the input CSV files.  These mirror the
+// columns produced by the SQL queries in `sample/`.
 interface CsvTable {
-  TABLE_NAME: string;
+  TABLE_NAME: string; // Name of a table in the database
 }
 
 interface CsvView {
-  VIEW_NAME: string;
+  VIEW_NAME: string; // Name of a view in the database
 }
 
+// Parent/child relationships are used to map views to their underlying tables
+// or tables to other tables (e.g. partition hierarchies).
 interface CsvParentChild {
   parent: string;
   child: string;
 }
 
+// The raw dependency export. Each record states that `NAME` (of type `TYPE`)
+// references another object `REFERENCED_NAME` of `REFERENCED_TYPE`.
 interface CsvDependency {
   REFERENCED_OWNER: string;
   NAME: string;
@@ -30,20 +53,31 @@ interface CsvDependency {
   REFERENCED_TYPE: string;
 }
 
+// Trigger metadata used to capture additional function usage information.
 interface CsvTriggerDetail {
   TABLE_NAME: string;
   TRIGGER_NAME: string;
   TRIGGER_TYPE: string;
   TRIGGERING_EVENT: string;
-  TRIGGER_BODY: string;
+  TRIGGER_BODY: string; // Raw PL/SQL body of the trigger
 }
 
+// Toggle for console warnings when unexpected data is encountered.  Leaving this
+// on helps catch data anomalies during the build process.
 const showWarnings = true;
+
+// Collection of all discovered database objects, indexed by `name+type`.
 const dbObjects = new Map<string, DbObject>();
+
+// Cache of `DependencyNode`s used while constructing the graph to avoid
+// rebuilding subtrees and to prevent infinite recursion on cyclic dependencies.
 const nodeCache = new Map<string, DependencyNode>();
 
 export default async function buildObjectStatistics() {
-  // Read CSV files
+  // -----------------------------------------------------------------------
+  // 1. Load raw data from CSV files
+  // -----------------------------------------------------------------------
+  // Each CSV file corresponds to a different aspect of the database schema.
   const tableNames = (await readCSV("../data/tables.csv")) as CsvTable[];
   console.log(`${tableNames.length} tables read from tables.csv`);
   const viewNames = (await readCSV("../data/views.csv")) as CsvView[];
@@ -69,6 +103,10 @@ export default async function buildObjectStatistics() {
 
   console.log("Processing all data. This may take several minutes...");
 
+  // -----------------------------------------------------------------------
+  // 2. Build DbObject instances for every discovered object
+  // -----------------------------------------------------------------------
+  // Seed the object map with the base set of tables and views.
   tableNames.forEach((table) => {
     const dbObject = new DbObject(table.TABLE_NAME, "TABLE");
     dbObjects.set(dbObject.id, dbObject);
@@ -77,6 +115,8 @@ export default async function buildObjectStatistics() {
     const dbObject = new DbObject(view.VIEW_NAME, "VIEW");
     dbObjects.set(dbObject.id, dbObject);
   });
+
+  // Resolve parent/child relationships to build table/view dependencies.
   parentChild.forEach((entry) => {
     if (dbObjects.has(`${entry.parent}+TABLE`)) {
       const dbObject = dbObjects.get(`${entry.parent}+TABLE`);
@@ -99,6 +139,10 @@ export default async function buildObjectStatistics() {
         console.warn("parent_child table/view not found: ", entry);
     }
   });
+
+  // Read dependency rows and merge them into the DbObject graph. Any referenced
+  // object that does not yet exist is created on the fly so that the graph is
+  // complete.
   dependencies.forEach((dependency) => {
     dependency.TYPE = normalizeType(dependency.TYPE);
     dependency.REFERENCED_TYPE = normalizeType(dependency.REFERENCED_TYPE);
@@ -112,6 +156,7 @@ export default async function buildObjectStatistics() {
       dbObjects.set(id, dbObject);
     }
 
+    // Ensure the referenced object exists in the map
     if (
       !dbObjects.has(
         `${dependency.REFERENCED_NAME}+${dependency.REFERENCED_TYPE}`,
@@ -124,6 +169,8 @@ export default async function buildObjectStatistics() {
       dbObjects.set(referencedObject.id, referencedObject);
     }
 
+    // Record the dependency by adding the referenced object to the appropriate
+    // set on the source object.
     if (dependency.REFERENCED_TYPE === "TABLE") {
       dbObject.tables.add(dependency.REFERENCED_NAME);
     } else if (dependency.REFERENCED_TYPE === "VIEW") {
@@ -144,6 +191,9 @@ export default async function buildObjectStatistics() {
       showWarnings && console.warn("unsupported reference type", dependency);
     }
   });
+
+  // Scan trigger bodies for function names. This is a heuristic approach that
+  // detects function usage within trigger PL/SQL source code.
   const functionNames = Object.keys(dbObjects).filter((key) =>
     key.endsWith("+FUNCTION"),
   );
@@ -155,6 +205,7 @@ export default async function buildObjectStatistics() {
       dbObjects.set(trigger.id, trigger);
     }
 
+    // Attach trigger to its table/view
     const table = dbObjects.get(`${triggerDetail.TABLE_NAME}+TABLE`);
     if (table) table.triggers.add(triggerDetail.TRIGGER_NAME);
 
@@ -168,6 +219,8 @@ export default async function buildObjectStatistics() {
           triggerDetail.TABLE_NAME,
         );
     }
+
+    // Naively search the trigger body for function invocations by string match.
     const upperCaseBody = triggerDetail.TRIGGER_BODY.toUpperCase();
     functionNames.forEach((functionName) => {
       if (upperCaseBody.includes(functionName)) {
@@ -178,11 +231,17 @@ export default async function buildObjectStatistics() {
 
   console.log("Finished combining data points");
 
+  // -----------------------------------------------------------------------
+  // 3. Serialize results
+  // -----------------------------------------------------------------------
   const nodes = writeJsonFiles();
 
   writeCsvFile(nodes);
 }
 
+// Normalize Oracle specific type names to the reduced set used by this tool.
+// This keeps the graph small and consistent by collapsing synonymous object
+// types (e.g. PROCEDURE -> FUNCTION).
 function normalizeType(type: string) {
   if (type === "PROCEDURE") {
     return "FUNCTION";
@@ -197,6 +256,12 @@ function normalizeType(type: string) {
   }
 }
 
+// Recursively convert the flat `DbObject` map into a tree of `DependencyNode`s.
+//
+// The `stack` array keeps track of the current traversal path.  It is used to
+// short‑circuit cycles so that the generated JSON is acyclic and safe to
+// serialize.  Nodes are memoized in `nodeCache` to avoid rebuilding the same
+// subtree multiple times.
 function buildNode(id: string, stack: string[] = []): DependencyNode {
   if (nodeCache.has(id)) return nodeCache.get(id)!;
 
@@ -253,11 +318,15 @@ function buildNode(id: string, stack: string[] = []): DependencyNode {
   return node;
 }
 
+// Build and write the final JSON artifacts used by the visualizer and the CLI.
+// Returns the array of fully populated `DependencyNode`s for further processing
+// (the CSV writer reuses the in‑memory representation).
 function writeJsonFiles(): DependencyNode[] {
   console.log("Sorting and writing data to JSON...");
 
   const nodes: DependencyNode[] = [];
 
+  // Construct a node for every known object.
   Array.from(dbObjects.keys()).forEach((id) => {
     nodes.push(buildNode(id));
   });
@@ -266,11 +335,13 @@ function writeJsonFiles(): DependencyNode[] {
 
   console.log(`Writing ${nodes.length} nodes...`);
 
+  // Compressed JSON used by the React visualizer.
   writeGzipJsonArray(
     join(__dirname, "/../data/visualization_data.json.gz"),
     nodes.map((node) => node.toVisualizationJson()),
   );
 
+  // Expanded JSON used by the CLI when searching for usages.
   writeJsonArray(
     join(__dirname, "/../data/nodes.json"),
     nodes.map((node) => node.toJson()),
@@ -281,6 +352,9 @@ function writeJsonFiles(): DependencyNode[] {
   return nodes;
 }
 
+// Helper to write an array of JSON objects to disk in gzip compressed form.
+// Writing manually rather than using `JSON.stringify` on the entire array keeps
+// memory usage low for large datasets.
 function writeGzipJsonArray(filename: string, jsonArray: unknown[]) {
   const buffers = [Buffer.from("[")];
   jsonArray.forEach((item, index) => {
@@ -298,6 +372,8 @@ function writeGzipJsonArray(filename: string, jsonArray: unknown[]) {
   writeFileSync(filename, finalBuffer);
 }
 
+// Similar to `writeGzipJsonArray` but writes plain JSON to disk using a stream
+// to avoid buffering the entire file in memory.
 function writeJsonArray(filename: string, jsonArray: unknown[]) {
   // eslint-disable-next-line security/detect-non-literal-fs-filename
   const writeStream = createWriteStream(filename);
@@ -311,6 +387,9 @@ function writeJsonArray(filename: string, jsonArray: unknown[]) {
   writeStream.end("]");
 }
 
+// Emit a CSV summarizing for each object both the dependencies it relies on and
+// the objects that depend on it (usage).  This is useful for quick spreadsheet
+// analysis without traversing the full graph.
 function writeCsvFile(nodes: DependencyNode[]) {
   console.log("Building usage stats and writing object statistics to CSV...");
 
@@ -338,7 +417,10 @@ function writeCsvFile(nodes: DependencyNode[]) {
   let fileContents = `${headerLabels.join(",")}\n`;
 
   nodes.forEach((node) => {
+    // Build a summary of this node's own dependencies
     const summary = buildNodeSummary(node);
+    // Determine which other nodes reference this one by walking the list of
+    // nodes and checking their dependency lists.
     nodes
       .filter(
         (innerNode) =>
