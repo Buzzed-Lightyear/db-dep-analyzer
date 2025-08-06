@@ -2,16 +2,35 @@ import { createReadStream } from "fs";
 import path from "path";
 import { parse } from "fast-csv";
 
+// ---------------------------------------------------------------------------
+// utils.ts
+// ---------------------------------------------------------------------------
+//
+// Shared classes and helper functions used across the CLI.  The core concepts
+// for representing the dependency graph live here:
+//   * DbObject      – lightweight representation of a database object and its
+//                     direct dependencies grouped by type
+//   * DependencyNode – recursive structure used for JSON serialization
+//   * NodeSummary    – aggregated counts of both dependencies (down) and usages
+//                     (up) for CSV output and CLI display
+//
+// This module also provides CSV parsing utilities.
+
 const nodeSummaryCache = new Map<string, NodeSummary>();
 
-// Uses single character members for smaller file output size
+// Uses single character members for smaller file output size when writing the
+// visualization JSON.  This keeps the client-side payload minimal.
 export interface VisualizationNode {
   i: string; // ID
-  e: boolean; // Duplicate
+  e: boolean; // Duplicate flag
   d: VisualizationNode[]; // Dependencies
   u: string[] | undefined; // UniqueDependencyIds
 }
 
+// Represents a raw database object along with collections of the objects it
+// depends on.  Each collection is a `Set` to avoid duplicates. This structure is
+// used while initially building the graph before it is converted into the more
+// serializable `DependencyNode` format.
 export class DbObject {
   readonly id: string;
   readonly name: string;
@@ -26,7 +45,7 @@ export class DbObject {
   readonly synonyms: Set<string>;
 
   constructor(name, type) {
-    this.id = `${name}+${type}`;
+    this.id = `${name}+${type}`; // Unique identifier used throughout the codebase
     this.name = name;
     this.type = type;
     this.tables = new Set();
@@ -40,6 +59,9 @@ export class DbObject {
   }
 }
 
+// Aggregated view of a node's relationships. `down` captures what the node
+// depends on, while `up` records which other objects depend on this node.  The
+// class provides a `rowDetails` getter used when outputting the summary CSV.
 export class NodeSummary {
   readonly id: string;
   readonly name: string;
@@ -51,6 +73,8 @@ export class NodeSummary {
     this.id = node.id;
     this.name = node.name;
     this.type = node.type;
+    // Upstream (usage) and downstream (dependencies) are represented with the
+    // same structure as `DbObject` for convenience.
     this.up = {
       id: "",
       name: "",
@@ -103,6 +127,8 @@ export class NodeSummary {
   }
 }
 
+// Tree structure representing dependencies recursively.  This is the format
+// written to `nodes.json` and consumed by both the CLI and the visualizer.
 export class DependencyNode {
   readonly id: string;
   readonly name: string;
@@ -118,6 +144,7 @@ export class DependencyNode {
     this.allDependencyIdsCache = [];
   }
 
+  // Recursively gather all dependency IDs for quick lookups later on.
   buildAllDependencyIds(node) {
     return [
       node.id,
@@ -132,6 +159,8 @@ export class DependencyNode {
     return this.allDependencyIdsCache;
   }
 
+  // Convert to the compact `VisualizationNode` format.  A cache is used to
+  // deduplicate nodes and mark duplicates with the `e` (exists) flag.
   toVisualizationJson(
     firstNode = true,
     nodeCache = new Map<string, VisualizationNode>(),
@@ -147,7 +176,7 @@ export class DependencyNode {
 
     const node = {
       i: this.id, // id
-      e: false, // dupe
+      e: false, // dupe flag
       d: this.dependencies.map((dependency) =>
         dependency.toVisualizationJson(false, nodeCache),
       ), // dependencies
@@ -173,6 +202,8 @@ export class DependencyNode {
     };
   }
 
+  // Collect a set of unique dependency ids for the entire subtree. Useful when
+  // generating the `u` property in the visualization JSON.
   getUniqueDependencyIds(ids: Set<string> = new Set<string>()): Set<string> {
     if (ids.has(this.id)) return ids;
 
@@ -186,6 +217,8 @@ export class DependencyNode {
   }
 }
 
+// Convenience wrapper around `fast-csv` that reads a CSV file relative to the
+// current module and resolves with an array of row objects.
 export async function readCSV(filename: string) {
   return new Promise((resolve, reject) => {
     const data: unknown[] = [];
@@ -204,7 +237,9 @@ export function buildNodeSummary(node: DependencyNode): NodeSummary {
   const nodeSummary = new NodeSummary(node);
   nodeSummaryCache.set(node.id, nodeSummary);
 
-  // Calculate dependency counts
+  // Calculate dependency counts by walking the dependency tree and aggregating
+  // unique names for each type. The recursion ensures transitive dependencies are
+  // accounted for.
   node.dependencies.forEach((dependency) => {
     const summary = buildNodeSummary(dependency);
 
@@ -270,6 +305,7 @@ export function findUsage(nodeSummary, node) {
         nodeSummary.up.synonyms.add(node.name);
       }
     }
+    // Continue walking the tree to find additional usages deeper in the graph.
     findUsage(nodeSummary, dependency);
   });
 }
