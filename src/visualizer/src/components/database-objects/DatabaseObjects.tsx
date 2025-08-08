@@ -1,9 +1,11 @@
 import { SplitPanel } from "@cloudscape-design/components";
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { DatabaseObject } from "../../utils/DataExtractor";
 import ObjectDependencyGraph from "./ObjectDependencyGraph";
 import ObjectTable from "./ObjectTable";
 import DdaAppLayout from "../common/DdaAppLayout";
+import ErrorBoundary from "../common/ErrorBoundary";
+import useResizeObserver from "../../hooks/useResizeObserver";
 
 export default function DatabaseObjects() {
   const splitPanelTopSpacing = 179; // size - 63 (header) - 3x20 (margins) - 56 (header)
@@ -16,6 +18,15 @@ export default function DatabaseObjects() {
   >();
   const [splitPanelSize, setSplitPanelSize] = useState(0);
   const [windowResizing, setWindowResizing] = useState(false);
+  const [parseMs, setParseMs] = useState(0);
+  const splitPanelRef = useRef<HTMLDivElement>(null);
+  const splitPanelRect = useResizeObserver(splitPanelRef);
+
+  useEffect(() => {
+    if (splitPanelRect) {
+      setSplitPanelSize(splitPanelRect.height - splitPanelTopSpacing);
+    }
+  }, [splitPanelRect]);
 
   const databaseObjectParser = useMemo(
     () =>
@@ -48,51 +59,28 @@ export default function DatabaseObjects() {
           throw new Error(`HTTP error: Status ${response.status}`);
         }
         const arrayBuffer = await response.arrayBuffer();
-        if (window.Worker) {
-          databaseObjectParser.postMessage(arrayBuffer);
-        }
+        databaseObjectParser.postMessage({ type: "parse", buffer: arrayBuffer });
       } catch (err) {
         console.error("Failed to fetch visualization_data", err);
       }
     };
 
-    if (window.Worker) {
-      databaseObjectParser.onmessage = (
-        event: MessageEvent<DatabaseObject[]>,
-      ) => {
+    const handleMessage = (event: MessageEvent<any>) => {
+      if (event.data.type === "parsed") {
         setDatabaseObjects(
-          event.data.map((dbObject) =>
-            // Ensure the event data gets the prototype for the DatabaseObject
+          event.data.databaseObjects.map((dbObject: DatabaseObject) =>
             Object.setPrototypeOf(dbObject, DatabaseObject.prototype),
           ),
         );
-      };
-    }
-
-    fetchData();
-  }, [databaseObjectParser]);
-
-  const updateSplitPanelSize = () => {
-    const sections = document.querySelectorAll(
-      'section[class^="awsui_split-panel-bottom"]',
-    );
-    if (sections.length === 0) {
-      return;
-    }
-    // NOTE: Without a setTimeout, this code doesn't properly resize the graph
-    setTimeout(() => {
-      const splitViewDrawerDivs = sections[0].querySelectorAll(
-        'div[class*="awsui_drawer"]',
-      );
-      if (splitViewDrawerDivs.length === 0) {
-        return;
+        setParseMs(event.data.parseMs);
       }
-      const splitViewHeight =
-        splitViewDrawerDivs[0].getBoundingClientRect().height;
+    };
 
-      setSplitPanelSize(splitViewHeight - splitPanelTopSpacing);
-    });
-  };
+    databaseObjectParser.addEventListener("message", handleMessage);
+    fetchData();
+    return () =>
+      databaseObjectParser.removeEventListener("message", handleMessage);
+  }, [databaseObjectParser]);
 
   return (
     <DdaAppLayout
@@ -103,39 +91,35 @@ export default function DatabaseObjects() {
           onObjectSelected={(dbObject) => {
             setSelectedObject(dbObject);
             if (dbObject) {
-              const firstOpen = !splitPanelOpen;
               setSplitPanelOpen(true);
-
-              // If panel isn't already open, we need to update the
-              // SplitPanelSize so the graph fits properly
-              if (firstOpen) {
-                updateSplitPanelSize();
-              }
             }
           }}
         />
       }
       splitPanelOpen={splitPanelOpen}
       onSplitPanelToggle={(event) => setSplitPanelOpen(event.detail.open)}
-      onSplitPanelResize={(event) =>
-        setSplitPanelSize(event.detail.size - splitPanelTopSpacing)
-      }
       splitPanel={
-        <SplitPanel
-          header={selectedObject?.title ?? "No Object Selected"}
-          hidePreferencesButton={true}
-          closeBehavior="hide"
-        >
-          {selectedObject ? (
-            <ObjectDependencyGraph
-              databaseObject={selectedObject}
-              splitPanelSize={splitPanelSize}
-              windowResizing={windowResizing}
-            />
-          ) : (
-            "Select an object to view its details"
-          )}
-        </SplitPanel>
+        <div ref={splitPanelRef}>
+          <SplitPanel
+            header={selectedObject?.title ?? "No Object Selected"}
+            hidePreferencesButton={true}
+            closeBehavior="hide"
+          >
+            {selectedObject ? (
+              <ErrorBoundary>
+                <ObjectDependencyGraph
+                  worker={databaseObjectParser}
+                  parseMs={parseMs}
+                  databaseObject={selectedObject}
+                  splitPanelSize={splitPanelSize}
+                  windowResizing={windowResizing}
+                />
+              </ErrorBoundary>
+            ) : (
+              "Select an object to view its details"
+            )}
+          </SplitPanel>
+        </div>
       }
     />
   );
