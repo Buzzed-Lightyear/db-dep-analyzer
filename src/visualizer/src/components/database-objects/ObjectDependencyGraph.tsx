@@ -9,7 +9,9 @@ import * as awsui from "@cloudscape-design/design-tokens";
 import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Toggle from "@cloudscape-design/components/toggle";
+import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import { useAppSettings } from "../../utils/AppSettings";
+import DagDependencyGraph from "./DagDependencyGraph";
 
 const TreeContainer = styled.div`
   border: 1px solid;
@@ -76,6 +78,8 @@ type Props = {
   databaseObject: DatabaseObject;
   splitPanelSize: number;
   windowResizing: boolean;
+  worker: Worker;
+  parseMs: number;
 };
 
 export default function ObjectDependencyGraph(props: Props) {
@@ -88,6 +92,7 @@ export default function ObjectDependencyGraph(props: Props) {
   const [graphData, setGraphData] = useState<RawNodeDatum | undefined>();
   const [dimensions, setDimensions] = useState<DOMRect | undefined>();
   const [toggleAllObjects, setToggleAllObjects] = useState<boolean>(false);
+  const [viewMode, setViewMode] = useState<"tree" | "dag">("tree");
   const [treeContainerHeight, setTreeContainerHeight] = useState<number>(
     Math.max(minTreeContainerHeight, props.splitPanelSize),
   );
@@ -107,6 +112,7 @@ export default function ObjectDependencyGraph(props: Props) {
     resetTranslation(tree);
     setToggleAllObjects(false);
     setGraphData(buildGraphData(props.databaseObject));
+    setViewMode("tree");
   }, [props.databaseObject, tree]);
 
   useEffect(() => {
@@ -152,12 +158,24 @@ export default function ObjectDependencyGraph(props: Props) {
         description="Select an object below to expand/collapse its dependencies. Pan the graph to move around, and use the scroll wheel to zoom in/out."
         actions={
           <SpaceBetween direction="horizontal" size="xs" alignItems="center">
-            <Toggle
-              onChange={({ detail }) => onToggleAllObjects(detail.checked)}
-              checked={toggleAllObjects}
-            >
-              Toggle all objects
-            </Toggle>
+            <SegmentedControl
+              selectedId={viewMode}
+              onChange={({ detail }) =>
+                setViewMode(detail.selectedId as "tree" | "dag")
+              }
+              options={[
+                { id: "tree", text: "Tree" },
+                { id: "dag", text: "DAG" },
+              ]}
+            />
+            {viewMode === "tree" && (
+              <Toggle
+                onChange={({ detail }) => onToggleAllObjects(detail.checked)}
+                checked={toggleAllObjects}
+              >
+                Toggle all objects
+              </Toggle>
+            )}
             <Button variant="primary" onClick={() => resetTranslation(tree)}>
               Reset view
             </Button>
@@ -166,48 +184,57 @@ export default function ObjectDependencyGraph(props: Props) {
       >
         Object Dependency Diagram
       </Header>
-      <TreeContainer
-        ref={(tc) => (treeContainer = tc)}
-        style={{ width: "100%", height: `${treeContainerHeight}px` }}
-      >
-        {graphData && (
-          <Tree
-            ref={(ref) => (tree = ref)}
-            data={graphData}
-            nodeSize={{
-              x: appSettings.compactModeEnabled ? 220 : 300,
-              y: appSettings.compactModeEnabled ? 80 : 100,
-            }}
-            translate={{ x: 200, y: 200 }}
-            collapsible={true}
-            hasInteractiveNodes={true}
-            shouldCollapseNeighborNodes={true}
-            dimensions={dimensions}
-            initialDepth={1}
-            centeringTransitionDuration={300}
-            renderCustomNodeElement={(nodeProps) => (
-              <NodeElement
-                nodeDatum={nodeProps.nodeDatum}
-                toggleNode={nodeProps.toggleNode}
-              />
-            )}
-          />
-        )}
-        <Legend direction="horizontal" size="m">
-          <LegendItem color={awsui.colorChartsStatusNeutral}>
-            <span />
-            Object with dependencies
-          </LegendItem>
-          <LegendItem color={awsui.colorChartsStatusMedium}>
-            <span />
-            Object with dependencies (duplicate)
-          </LegendItem>
-          <LegendItem color={awsui.colorChartsStatusInfo}>
-            <span />
-            Object with no dependencies
-          </LegendItem>
-        </Legend>
-      </TreeContainer>
+      {viewMode === "tree" ? (
+        <TreeContainer
+          ref={(tc) => (treeContainer = tc)}
+          style={{ width: "100%", height: `${treeContainerHeight}px` }}
+        >
+          {graphData && (
+            <Tree
+              ref={(ref) => (tree = ref)}
+              data={graphData}
+              nodeSize={{
+                x: appSettings.compactModeEnabled ? 220 : 300,
+                y: appSettings.compactModeEnabled ? 80 : 100,
+              }}
+              translate={{ x: 200, y: 200 }}
+              collapsible={true}
+              hasInteractiveNodes={true}
+              shouldCollapseNeighborNodes={true}
+              dimensions={dimensions}
+              initialDepth={1}
+              centeringTransitionDuration={300}
+              renderCustomNodeElement={(nodeProps) => (
+                <NodeElement
+                  nodeDatum={nodeProps.nodeDatum}
+                  toggleNode={nodeProps.toggleNode}
+                />
+              )}
+            />
+          )}
+          <Legend direction="horizontal" size="m">
+            <LegendItem color={awsui.colorChartsStatusNeutral}>
+              <span />
+              Object with dependencies
+            </LegendItem>
+            <LegendItem color={awsui.colorChartsStatusMedium}>
+              <span />
+              Object with dependencies (duplicate)
+            </LegendItem>
+            <LegendItem color={awsui.colorChartsStatusInfo}>
+              <span />
+              Object with no dependencies
+            </LegendItem>
+          </Legend>
+        </TreeContainer>
+      ) : (
+        <DagDependencyGraph
+          worker={props.worker}
+          databaseObject={props.databaseObject}
+          parseMs={props.parseMs}
+          splitPanelSize={treeContainerHeight}
+        />
+      )}
     </SpaceBetween>
   );
 }
